@@ -1,0 +1,1197 @@
+import discord
+from discord import app_commands
+from discord.ext import commands
+import json
+import os
+from datetime import datetime, timedelta, timezone
+import discord.utils
+import logging
+import logging.handlers
+from typing import Dict, List, Optional, Union
+from dotenv import load_dotenv
+import asyncio
+
+# Enhanced .env file loading
+def load_environment():
+    env_path = os.path.join(os.path.dirname(__file__), '.env')
+    if not os.path.exists(env_path):
+        raise FileNotFoundError(f"No .env file found at {env_path}")
+    
+    load_dotenv(env_path)
+    token = os.getenv('DISCORD_BOT_TOKEN')
+    
+    if not token:
+        raise ValueError("No DISCORD_BOT_TOKEN found in .env file")
+    return token
+
+# Load environment variables
+try:
+    TOKEN = load_environment()
+except Exception as e:
+    print(f"Failed to load environment: {e}")
+    exit(1)
+
+# Initialize bot with slash commands
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+intents.messages = True
+
+class BotConfig:
+    """Handles configuration loading and validation"""
+    
+    def __init__(self):
+        self.config_file = 'config.json'
+        self.default_config = {
+            "banned_words": {
+                "low": ["badword1", "badword2"],
+                "medium": ["worseword1", "worseword2"],
+                "high": ["bannedword1", "bannedword2"]
+            },
+            "actions": {
+                "low": "warn",
+                "medium": "timeout",
+                "high": "ban"
+            },
+            "max_warnings": 3,
+            "max_timeouts": 2,
+            "timeout_durations": {
+                "first": 60,
+                "second": 1440,
+                "third": 10080
+            },
+            "whitelisted_channels": [],
+            "whitelisted_roles": [],
+            "moderation_roles": [],
+            "log_channel": None
+        }
+        self.config = self.load_config()
+        
+    def load_config(self) -> Dict:
+        """Load and validate the configuration file"""
+        if not os.path.exists(self.config_file):
+            with open(self.config_file, 'w') as f:
+                json.dump(self.default_config, f, indent=4)
+            return self.default_config
+            
+        with open(self.config_file, 'r') as f:
+            config = json.load(f)
+            
+        # Validate config structure
+        for key in self.default_config.keys():
+            if key not in config:
+                config[key] = self.default_config[key]
+                logger.warning(f"Missing config key {key}, using default")
+                
+        return config
+        
+    def save_config(self):
+        """Save the current configuration to file"""
+        with open(self.config_file, 'w') as f:
+            json.dump(self.config, f, indent=4)
+            
+    def refresh_config(self):
+        """Reload the configuration from file"""
+        self.config = self.load_config()
+
+class InfractionsManager:
+    """Handles loading, saving, and managing user infractions"""
+    
+    def __init__(self):
+        self.file_path = 'infractions.json'
+        self.data = self.load_infractions()
+        
+    def load_infractions(self) -> Dict:
+        """Load infractions from file"""
+        if not os.path.exists(self.file_path):
+            return {}
+            
+        try:
+            with open(self.file_path, 'r') as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            logger.error("Failed to parse infractions file, starting fresh")
+            return {}
+            
+    def save_infractions(self):
+        """Save infractions to file"""
+        with open(self.file_path, 'w') as f:
+            json.dump(self.data, f, indent=4)
+            
+    def get_user_data(self, user_id: str) -> Dict:
+        """Get a user's infraction data with timestamps"""
+        default_data = {
+            "warnings": [],
+            "timeouts": [],
+            "kicks": [],
+            "bans": [],
+            "last_timeout": None
+        }
+        data = self.data.get(str(user_id), default_data.copy())
+        
+        # Convert old format to new timestamped format
+        if isinstance(data.get("warnings", 0), int):
+            data = default_data.copy()
+            data.update({
+                "warnings": [datetime.utcnow().isoformat()] * self.data.get(str(user_id), {}).get("warnings", 0),
+                "timeouts": [datetime.utcnow().isoformat()] * self.data.get(str(user_id), {}).get("timeouts", 0),
+                "kicks": [datetime.utcnow().isoformat()] * self.data.get(str(user_id), {}).get("kicks", 0),
+                "bans": [datetime.utcnow().isoformat()] * self.data.get(str(user_id), {}).get("bans", 0),
+                "last_timeout": self.data.get(str(user_id), {}).get("last_timeout")
+            })
+            self.data[str(user_id)] = data
+            self.save_infractions()
+            
+        return data
+        
+    def clear_user_infractions(self, user_id: str) -> bool:
+        """Clear all infractions for a user"""
+        user_id = str(user_id)
+        if user_id in self.data:
+            del self.data[user_id]
+            self.save_infractions()
+            return True
+        return False
+    
+    def count_recent_infractions(self, user_id: str, infraction_type: str, days: int = 30) -> int:
+        """Count infractions of a specific type within the last X days"""
+        user_data = self.get_user_data(user_id)
+        now = datetime.utcnow()
+        cutoff = now - timedelta(days=days)
+        
+        return sum(
+            1 for timestamp in user_data.get(infraction_type, [])
+            if datetime.fromisoformat(timestamp) > cutoff
+        )
+
+class DiscordHandler(logging.Handler):
+    """Custom logging handler to send logs to Discord channel"""
+    
+    def __init__(self, bot):
+        super().__init__()
+        self.bot = bot
+        
+    def emit(self, record):
+        log_entry = self.format(record)
+        if self.bot.config.config.get("log_channel"):
+            channel = self.bot.get_channel(self.bot.config.config["log_channel"])
+            if channel:
+                self.bot.loop.create_task(channel.send(f"`{log_entry}`"))
+
+# Configure logging
+logger = logging.getLogger('discord')
+logger.setLevel(logging.INFO)
+
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(handler)
+
+file_handler = logging.FileHandler('bot.log')
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(file_handler)
+
+class MyBot(commands.Bot):
+    """Main bot class with enhanced security and functionality"""
+    
+    def __init__(self):
+        super().__init__(
+            command_prefix='/',
+            intents=intents,
+            activity=discord.Activity(
+                type=discord.ActivityType.watching,
+                name="over your servers!"
+            )
+        )
+        self.config = BotConfig()
+        self.infractions = InfractionsManager()
+        self.rate_limits = {}
+        self.locked_channels = set()
+        
+    async def setup_hook(self):
+        """Sync commands and perform startup tasks"""
+        await self.tree.sync()
+        logger.info("Commands synced globally")
+        
+        # Add Discord logging handler after bot is ready
+        discord_handler = DiscordHandler(self)
+        discord_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        logger.addHandler(discord_handler)
+        
+    async def check_permissions(self, interaction: discord.Interaction) -> bool:
+        """Check if the bot has necessary permissions"""
+        if not interaction.guild:
+            return False
+            
+        required_perms = discord.Permissions(
+            manage_messages=True,
+            moderate_members=True,
+            kick_members=True,
+            ban_members=True,
+            manage_channels=True,
+            manage_roles=True
+        )
+        
+        if not interaction.guild.me.guild_permissions >= required_perms:
+            try:
+                await interaction.response.send_message(
+                    "❌ I don't have the required permissions to perform this action.",
+                    ephemeral=True
+                )
+            except:
+                pass
+            return False
+        return True
+        
+    async def is_whitelisted(self, ctx: Union[discord.Message, discord.Interaction]) -> bool:
+        """Check if context is whitelisted"""
+        if isinstance(ctx, discord.Message):
+            channel = ctx.channel
+            author = ctx.author
+        else:
+            channel = ctx.channel
+            author = ctx.user
+            
+        # Check channel whitelist
+        if channel.id in self.config.config["whitelisted_channels"]:
+            return True
+            
+        # Check role whitelist
+        if any(role.id in self.config.config["whitelisted_roles"] for role in author.roles):
+            return True
+            
+        return False
+        
+    async def is_moderator(self, user: discord.Member) -> bool:
+        """Check if user has moderation privileges"""
+        return any(role.id in self.config.config["moderation_roles"] for role in user.roles)
+        
+    async def check_rate_limit(self, user_id: int, command: str, limit: int = 3, window: int = 60) -> bool:
+        """Check if user is being rate limited"""
+        now = datetime.utcnow().timestamp()
+        key = f"{user_id}_{command}"
+        
+        if key not in self.rate_limits:
+            self.rate_limits[key] = []
+            
+        # Remove old timestamps
+        self.rate_limits[key] = [t for t in self.rate_limits[key] if now - t < window]
+        
+        if len(self.rate_limits[key]) >= limit:
+            return False
+            
+        self.rate_limits[key].append(now)
+        return True
+
+bot = MyBot()
+
+async def apply_timeout(member: discord.Member, offense_count: int, reason: str = "Banned word usage") -> Union[datetime, str]:
+    """Apply timeout to a member based on offense count"""
+    try:
+        durations = bot.config.config["timeout_durations"]
+        
+        if offense_count == 1:
+            duration = durations["first"]
+        elif offense_count == 2:
+            duration = durations["second"]
+        else:
+            duration = durations["third"]
+        
+        # Use timezone-aware datetime
+        until = discord.utils.utcnow() + timedelta(minutes=duration)
+        
+        await member.timeout(until, reason=reason)
+        return until
+        
+    except KeyError as e:
+        logger.error(f"Missing timeout duration configuration: {e}")
+        return "missing_config"
+    except discord.Forbidden:
+        return "missing_permissions"
+    except discord.HTTPException as e:
+        logger.error(f"Timeout HTTP error: {e}")
+        return "http_error"
+    except Exception as e:
+        logger.error(f"Timeout error: {e}")
+        return "unknown_error"
+
+async def log_action(action: str, user: discord.Member, moderator: discord.Member = None, 
+                    reason: str = None, duration: str = None, channel: discord.TextChannel = None):
+    """Log moderation actions to the log channel"""
+    if not bot.config.config.get("log_channel"):
+        return
+        
+    log_channel = bot.get_channel(bot.config.config["log_channel"])
+    if not log_channel:
+        return
+        
+    embed = discord.Embed(
+        title=f"Moderation Action: {action}",
+        color=discord.Color.orange(),
+        timestamp=datetime.utcnow()
+    )
+    
+    embed.add_field(name="User", value=f"{user.mention} ({user.id})", inline=False)
+    if moderator:
+        embed.add_field(name="Moderator", value=moderator.mention, inline=False)
+    if reason:
+        embed.add_field(name="Reason", value=reason, inline=False)
+    if duration:
+        embed.add_field(name="Duration", value=duration, inline=False)
+    if channel:
+        embed.add_field(name="Channel", value=channel.mention, inline=False)
+        
+    await log_channel.send(embed=embed)
+
+@bot.event
+async def on_ready():
+    """Bot startup handler"""
+    logger.info(f'Logged in as {bot.user} (ID: {bot.user.id})')
+    logger.info('------')
+    
+    # Create log channel if it doesn't exist
+    if not bot.config.config.get("log_channel"):
+        for guild in bot.guilds:
+            try:
+                if not any(channel.name == "moderation-logs" for channel in guild.channels):
+                    overwrites = {
+                        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                        guild.me: discord.PermissionOverwrite(read_messages=True)
+                    }
+                    channel = await guild.create_text_channel(
+                        "moderation-logs",
+                        overwrites=overwrites,
+                        reason="Creating moderation log channel"
+                    )
+                    bot.config.config["log_channel"] = channel.id
+                    bot.config.save_config()
+                    logger.info(f"Created log channel in {guild.name}")
+            except Exception as e:
+                logger.error(f"Couldn't create log channel in {guild.name}: {e}")
+
+@bot.event
+async def on_message(message: discord.Message):
+    """Handle message events for banned word detection"""
+    if (message.author.bot or 
+        await bot.is_whitelisted(message) or 
+        not isinstance(message.channel, discord.TextChannel)):
+        return
+        
+    # Check if channel is locked
+    if message.channel.id in bot.locked_channels and not await bot.is_moderator(message.author):
+        try:
+            await message.delete()
+            await message.author.send(f"⚠️ This channel is currently locked. You cannot send messages here.")
+        except:
+            pass
+        return
+        
+    content = message.content.lower()
+    found_severity = None
+    
+    # Check for banned words
+    for severity, words in bot.config.config["banned_words"].items():
+        if any(word.lower() in content for word in words):
+            found_severity = severity
+            break
+    
+    if found_severity:
+        user_id = str(message.author.id)
+        user_data = bot.infractions.get_user_data(user_id)
+        action = bot.config.config["actions"][found_severity]
+        reason = f"Used banned word ({found_severity} severity): {content[:50]}..."
+        
+        # Check recent infractions for escalation
+        recent_warnings = bot.infractions.count_recent_infractions(user_id, "warnings")
+        recent_timeouts = bot.infractions.count_recent_infractions(user_id, "timeouts")
+        recent_kicks = bot.infractions.count_recent_infractions(user_id, "kicks")
+        
+        if action == "warn" and recent_warnings >= 2:  # 3rd warning
+            action = "timeout"
+        elif action == "timeout" and recent_timeouts >= 2:  # 3rd timeout
+            action = "kick"
+        elif action == "kick" and recent_kicks >= 2:  # 3rd kick
+            action = "ban"
+        
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            logger.warning(f"Couldn't delete message in {message.channel.name} - missing permissions")
+        except Exception as e:
+            logger.error(f"Error deleting message: {e}")
+
+        user_id = str(message.author.id)
+        user_data = bot.infractions.get_user_data(user_id)
+        
+        action = bot.config.config["actions"][found_severity]
+        reason = f"Used banned word ({found_severity} severity): {content[:50]}..."
+        
+        # Escalate actions based on previous infractions
+        if action == "warn" and user_data["warnings"] >= bot.config.config["max_warnings"]:
+            action = "timeout"
+        elif action == "timeout" and user_data["timeouts"] >= bot.config.config["max_timeouts"]:
+            action = "kick"
+        
+        try:
+            if action == "warn":
+                user_data["warnings"].append(datetime.utcnow().isoformat())
+                user_data["warnings"] += 1
+                try:
+                    await message.author.send(
+                        f"⚠️ Warning {user_data['warnings']}/{bot.config.config['max_warnings']}\n"
+                        f"Reason: {reason}"
+                    )
+                except discord.Forbidden:
+                    logger.warning(f"Couldn't DM warning to {message.author}")
+                except Exception as e:
+                    logger.error(f"Warning DM error: {e}")
+                
+                await log_action("Warning", message.author, reason=reason)
+
+            elif action == "timeout":
+                user_data["timeouts"] += 1
+                result = await apply_timeout(message.author, user_data["timeouts"], reason)
+                
+                if isinstance(result, str):
+                    error_msg = {
+                        "missing_permissions": "I don't have permission to timeout this user",
+                        "http_error": "Error communicating with Discord",
+                        "missing_config": "Timeout configuration is missing",
+                        "unknown_error": "Unknown error occurred"
+                    }.get(result, "Failed to timeout user")
+                    logger.error(f"Couldn't timeout {message.author}: {error_msg}")
+                else:
+                    user_data["last_timeout"] = result.isoformat()
+                    duration = f"{(bot.config.config['timeout_durations']['first'] if user_data['timeouts'] == 1 else bot.config.config['timeout_durations']['second'] if user_data['timeouts'] == 2 else bot.config.config['timeout_durations']['third'])} minutes"
+                    try:
+                        await message.author.send(
+                            f"⏳ Timed out for {duration} until {result.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                            f"Reason: {reason}"
+                        )
+                    except discord.Forbidden:
+                        logger.warning(f"Couldn't DM timeout notice to {message.author}")
+                    except Exception as e:
+                        logger.error(f"Timeout DM error: {e}")
+                    
+                    await log_action("Timeout", message.author, reason=reason, duration=duration)
+
+            elif action == "kick":
+                user_data["kicks"] += 1
+                try:
+                    await message.author.send(f"🚪 You've been kicked\nReason: {reason}")
+                except discord.Forbidden:
+                    logger.warning(f"Couldn't DM kick notice to {message.author}")
+                except Exception as e:
+                    logger.error(f"Kick DM error: {e}")
+                
+                try:
+                    await message.author.kick(reason=reason)
+                    await log_action("Kick", message.author, reason=reason)
+                except discord.Forbidden:
+                    logger.error(f"Couldn't kick {message.author} - missing permissions")
+                except discord.HTTPException as e:
+                    logger.error(f"Kick HTTP error: {e}")
+                    
+            elif action == "ban":
+                user_data["bans"] += 1
+                try:
+                    await message.author.send(f"🔨 You've been banned\nReason: {reason}")
+                except discord.Forbidden:
+                    logger.warning(f"Couldn't DM ban notice to {message.author}")
+                except Exception as e:
+                    logger.error(f"Ban DM error: {e}")
+                
+                try:
+                    await message.author.ban(reason=reason, delete_message_days=1)
+                    await log_action("Ban", message.author, reason=reason)
+                except discord.Forbidden:
+                    logger.error(f"Couldn't ban {message.author} - missing permissions")
+                except discord.HTTPException as e:
+                    logger.error(f"Ban HTTP error: {e}")
+            
+            bot.infractions.data[user_id] = user_data
+            bot.infractions.save_infractions()
+            
+        except Exception as e:
+            logger.error(f"Moderation error: {e}")
+
+# Moderation commands
+@bot.tree.command(name="lockdown", description="Lock all channels (except for mods)")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def lockdown(interaction: discord.Interaction):
+    """Lock all text channels in the server"""
+    if not await bot.check_permissions(interaction):
+        return
+        
+    await interaction.response.defer()
+    
+    locked_channels = 0
+    for channel in interaction.guild.text_channels:
+        try:
+            await channel.set_permissions(
+                interaction.guild.default_role,
+                send_messages=False,
+                reason=f"Server lockdown initiated by {interaction.user}"
+            )
+            locked_channels += 1
+            bot.locked_channels.add(channel.id)
+        except Exception as e:
+            logger.error(f"Couldn't lock {channel.name}: {e}")
+    
+    await log_action("Server Lockdown", interaction.user, channel=None, reason="Initiated server-wide lockdown")
+    await interaction.followup.send(f"🔒 Locked down {locked_channels} channels. Only moderators can now send messages.")
+
+@bot.tree.command(name="unlockdown", description="Unlock all channels")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def unlockdown(interaction: discord.Interaction):
+    """Unlock all text channels in the server"""
+    if not await bot.check_permissions(interaction):
+        return
+        
+    await interaction.response.defer()
+    
+    unlocked_channels = 0
+    for channel in interaction.guild.text_channels:
+        try:
+            await channel.set_permissions(
+                interaction.guild.default_role,
+                send_messages=None,
+                reason=f"Server unlock initiated by {interaction.user}"
+            )
+            unlocked_channels += 1
+            bot.locked_channels.discard(channel.id)
+        except Exception as e:
+            logger.error(f"Couldn't unlock {channel.name}: {e}")
+    
+    await log_action("Server Unlock", interaction.user, channel=None, reason="Removed server-wide lockdown")
+    await interaction.followup.send(f"🔓 Unlocked {unlocked_channels} channels.")
+
+@bot.tree.command(name="lock_channel", description="Lock a specific channel")
+@app_commands.describe(channel="The channel to lock")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def lock_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    """Lock a specific text channel"""
+    if not await bot.check_permissions(interaction):
+        return
+        
+    try:
+        await channel.set_permissions(
+            interaction.guild.default_role,
+            send_messages=False,
+            reason=f"Channel lock by {interaction.user}"
+        )
+        bot.locked_channels.add(channel.id)
+        await log_action("Channel Lock", interaction.user, channel=channel, reason="Locked this channel")
+        await interaction.response.send_message(f"🔒 Locked {channel.mention}. Only moderators can now send messages here.")
+    except Exception as e:
+        logger.error(f"Couldn't lock channel: {e}")
+        await interaction.response.send_message("❌ Failed to lock channel.", ephemeral=True)
+
+@bot.tree.command(name="unlock_channel", description="Unlock a specific channel")
+@app_commands.describe(channel="The channel to unlock")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def unlock_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    """Unlock a specific text channel"""
+    if not await bot.check_permissions(interaction):
+        return
+        
+    try:
+        await channel.set_permissions(
+            interaction.guild.default_role,
+            send_messages=None,
+            reason=f"Channel unlock by {interaction.user}"
+        )
+        bot.locked_channels.discard(channel.id)
+        await log_action("Channel Unlock", interaction.user, channel=channel, reason="Unlocked this channel")
+        await interaction.response.send_message(f"🔓 Unlocked {channel.mention}.")
+    except Exception as e:
+        logger.error(f"Couldn't unlock channel: {e}")
+        await interaction.response.send_message("❌ Failed to unlock channel.", ephemeral=True)
+
+@bot.tree.command(name="add_word", description="Add a word to the banned list")
+@app_commands.describe(
+    severity="The severity level",
+    word="The word to ban"
+)
+@app_commands.choices(severity=[
+    app_commands.Choice(name="Low", value="low"),
+    app_commands.Choice(name="Medium", value="medium"),
+    app_commands.Choice(name="High", value="high")
+])
+async def add_word(interaction: discord.Interaction, severity: app_commands.Choice[str], word: str):
+    """Add a word to the banned words list"""
+    if not interaction.user.guild_permissions.manage_messages:
+        return await interaction.response.send_message(
+            "❌ You don't have permission to use this command.",
+            ephemeral=True
+        )
+        
+    if not await bot.check_permissions(interaction):
+        return
+        
+    if not await bot.check_rate_limit(interaction.user.id, "add_word"):
+        return await interaction.response.send_message(
+            "⏳ Please slow down with this command.",
+            ephemeral=True
+        )
+    
+    severity = severity.value
+    if word.lower() in [w.lower() for w in bot.config.config["banned_words"][severity]]:
+        await interaction.response.send_message(
+            "ℹ️ Word already exists in this severity level",
+            ephemeral=True
+        )
+        return
+    
+    bot.config.config["banned_words"][severity].append(word)
+    bot.config.save_config()
+    await interaction.response.send_message(
+        f"✅ Added `{word}` to {severity} severity list",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="remove_word", description="Remove a word from the banned list")
+@app_commands.describe(
+    severity="The severity level",
+    word="The word to remove"
+)
+@app_commands.choices(severity=[
+    app_commands.Choice(name="Low", value="low"),
+    app_commands.Choice(name="Medium", value="medium"),
+    app_commands.Choice(name="High", value="high")
+])
+async def remove_word(interaction: discord.Interaction, severity: app_commands.Choice[str], word: str):
+    """Remove a word from the banned words list"""
+    if not interaction.user.guild_permissions.manage_messages:
+        return await interaction.response.send_message(
+            "❌ You don't have permission to use this command.",
+            ephemeral=True
+        )
+        
+    if not await bot.check_permissions(interaction):
+        return
+        
+    if not await bot.check_rate_limit(interaction.user.id, "remove_word"):
+        return await interaction.response.send_message(
+            "⏳ Please slow down with this command.",
+            ephemeral=True
+        )
+    
+    severity = severity.value
+    if word.lower() not in [w.lower() for w in bot.config.config["banned_words"][severity]]:
+        await interaction.response.send_message(
+            "ℹ️ Word not found in this severity level",
+            ephemeral=True
+        )
+        return
+    
+    bot.config.config["banned_words"][severity] = [
+        w for w in bot.config.config["banned_words"][severity] 
+        if w.lower() != word.lower()
+    ]
+    bot.config.save_config()
+    await interaction.response.send_message(
+        f"✅ Removed `{word}` from {severity} severity list",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="list_words", description="List all banned words")
+async def list_words(interaction: discord.Interaction):
+    """List all currently banned words"""
+    if not interaction.user.guild_permissions.manage_messages:
+        return await interaction.response.send_message(
+            "❌ You don't have permission to use this command.",
+            ephemeral=True
+        )
+        
+    if not await bot.check_rate_limit(interaction.user.id, "list_words"):
+        return await interaction.response.send_message(
+            "⏳ Please slow down with this command.",
+            ephemeral=True
+        )
+    
+    embed = discord.Embed(title="Banned Words List", color=discord.Color.red())
+    for severity, words in bot.config.config["banned_words"].items():
+        embed.add_field(
+            name=f"{severity.capitalize()} Severity",
+            value=", ".join(f'`{w}`' for w in words) if words else "None",
+            inline=False
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="infractions", description="Check a user's infractions")
+@app_commands.describe(user="The user to check")
+async def infractions(interaction: discord.Interaction, user: discord.Member):
+    """Check a user's infraction history"""
+    if not interaction.user.guild_permissions.manage_messages:
+        return await interaction.response.send_message(
+            "❌ You don't have permission to use this command.",
+            ephemeral=True
+        )
+        
+    if not await bot.check_rate_limit(interaction.user.id, "infractions"):
+        return await interaction.response.send_message(
+            "⏳ Please slow down with this command.",
+            ephemeral=True
+        )
+    
+    user_data = bot.infractions.get_user_data(user.id)
+    
+    embed = discord.Embed(
+        title=f"Infractions for {user.display_name}",
+        color=discord.Color.orange()
+    )
+    embed.add_field(
+        name="Warnings", 
+        value=f"{user_data['warnings']}/{bot.config.config['max_warnings']}"
+    )
+    embed.add_field(name="Timeouts", value=user_data['timeouts'])
+    embed.add_field(name="Kicks", value=user_data['kicks'])
+    embed.add_field(name="Bans", value=user_data['bans'])
+    embed.set_thumbnail(url=user.display_avatar.url)
+    
+    if user_data['last_timeout']:
+        last_timeout = datetime.fromisoformat(user_data['last_timeout'])
+        embed.add_field(
+            name="Last Timeout", 
+            value=last_timeout.strftime('%Y-%m-%d %H:%M UTC'),
+            inline=False
+        )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="clear_infractions", description="Clear a user's infractions")
+@app_commands.describe(user="The user to clear infractions for")
+async def clear_infractions_command(interaction: discord.Interaction, user: discord.Member):
+    """Clear a user's infraction history"""
+    if not interaction.user.guild_permissions.manage_messages:
+        return await interaction.response.send_message(
+            "❌ You don't have permission to use this command.",
+            ephemeral=True
+        )
+        
+    if not await bot.check_permissions(interaction):
+        return
+        
+    if not await bot.check_rate_limit(interaction.user.id, "clear_infractions"):
+        return await interaction.response.send_message(
+            "⏳ Please slow down with this command.",
+            ephemeral=True
+        )
+    
+    if bot.infractions.clear_user_infractions(user.id):
+        await interaction.response.send_message(
+            f"✅ Cleared all infractions for {user.display_name}",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"ℹ️ No infractions found for {user.display_name}",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="purge_user", description="Delete messages from a user in a timeframe")
+@app_commands.describe(
+    user="The user to purge messages from",
+    hours="Number of hours to look back (default: 1)",
+    minutes="Number of minutes to look back (default: 0)"
+)
+async def purge_user(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    hours: int = 1,
+    minutes: int = 0
+):
+    """Purge messages from a specific user"""
+    if not interaction.user.guild_permissions.manage_messages:
+        return await interaction.response.send_message(
+            "❌ You don't have permission to use this command.",
+            ephemeral=True
+        )
+        
+    if not await bot.check_permissions(interaction):
+        return
+    
+    if hours < 0 or minutes < 0:
+        await interaction.response.send_message(
+            "❌ Time values cannot be negative",
+            ephemeral=True
+        )
+        return
+    
+    total_minutes = (hours * 60) + minutes
+    if total_minutes <= 0:
+        await interaction.response.send_message(
+            "❌ Time window must be greater than 0",
+            ephemeral=True
+        )
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    cutoff = datetime.utcnow() - timedelta(minutes=total_minutes)
+    count = 0
+    
+    try:
+        async for message in interaction.channel.history(limit=None, after=cutoff):
+            if message.author.id == user.id:
+                try:
+                    await message.delete()
+                    count += 1
+                    await asyncio.sleep(0.25)  # Rate limiting
+                except discord.Forbidden:
+                    logger.warning(f"Couldn't delete message {message.id} - missing permissions")
+                except discord.HTTPException as e:
+                    logger.error(f"Error deleting message: {e}")
+        
+        await interaction.followup.send(
+            f"✅ Deleted {count} messages from {user.display_name} in the last {hours}h {minutes}m",
+            ephemeral=True
+        )
+    except Exception as e:
+        logger.error(f"Purge error: {e}")
+        await interaction.followup.send(
+            f"❌ Error purging messages: {str(e)}",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="purge_channel", description="Delete all messages in a timeframe")
+@app_commands.describe(
+    hours="Number of hours to look back (default: 1)",
+    minutes="Number of minutes to look back (default: 0)"
+)
+async def purge_channel(
+    interaction: discord.Interaction,
+    hours: int = 1,
+    minutes: int = 0
+):
+    """Purge all messages in a channel"""
+    if not interaction.user.guild_permissions.manage_messages:
+        return await interaction.response.send_message(
+            "❌ You don't have permission to use this command.",
+            ephemeral=True
+        )
+        
+    if not await bot.check_permissions(interaction):
+        return
+    
+    if hours < 0 or minutes < 0:
+        await interaction.response.send_message(
+            "❌ Time values cannot be negative",
+            ephemeral=True
+        )
+        return
+    
+    total_minutes = (hours * 60) + minutes
+    if total_minutes <= 0:
+        await interaction.response.send_message(
+            "❌ Time window must be greater than 0",
+            ephemeral=True
+        )
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    cutoff = datetime.utcnow() - timedelta(minutes=total_minutes)
+    count = 0
+    
+    try:
+        async for message in interaction.channel.history(limit=None, after=cutoff):
+            try:
+                await message.delete()
+                count += 1
+                await asyncio.sleep(0.25)  # Rate limiting
+            except discord.Forbidden:
+                logger.warning(f"Couldn't delete message {message.id} - missing permissions")
+            except discord.HTTPException as e:
+                logger.error(f"Error deleting message: {e}")
+        
+        await interaction.followup.send(
+            f"✅ Deleted {count} messages in the last {hours}h {minutes}m",
+            ephemeral=True
+        )
+    except Exception as e:
+        logger.error(f"Purge error: {e}")
+        await interaction.followup.send(
+            f"❌ Error purging messages: {str(e)}",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="reload_config", description="Reload the bot configuration")
+async def reload_config(interaction: discord.Interaction):
+    """Reload the configuration file"""
+    if not interaction.user.guild_permissions.manage_messages:
+        return await interaction.response.send_message(
+            "❌ You don't have permission to use this command.",
+            ephemeral=True
+        )
+        
+    bot.config.refresh_config()
+    await interaction.response.send_message(
+        "✅ Configuration reloaded successfully",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="untimeout", description="Remove timeout from a user")
+@app_commands.describe(
+    user="The user to remove timeout from",
+    reason="Reason for removing timeout"
+)
+@app_commands.checks.has_permissions(moderate_members=True)
+async def untimeout_user(interaction: discord.Interaction, user: discord.Member, reason: str = None):
+    """Remove timeout from a user"""
+    if not await bot.check_permissions(interaction):
+        return
+        
+    try:
+        await user.timeout(None, reason=reason)
+        await log_action("Remove Timeout", user, interaction.user, reason)
+        await interaction.response.send_message(
+            f"⏳ Removed timeout from {user.mention}" + 
+            (f"\nReason: {reason}" if reason else "")
+        )
+    except Exception as e:
+        await interaction.response.send_message(f"Failed to remove timeout: {e}", ephemeral=True)
+
+@bot.tree.command(name="unban", description="Unban a user")
+@app_commands.describe(
+    user="The user to unban (ID or name#discriminator)",
+    reason="Reason for unbanning"
+)
+@app_commands.checks.has_permissions(ban_members=True)
+async def unban_user(interaction: discord.Interaction, user: str, reason: str = None):
+    """Unban a user"""
+    if not await bot.check_permissions(interaction):
+        return
+        
+    try:
+        # Try to get banned users
+        banned_users = [ban.user async for ban in interaction.guild.bans()]
+        
+        # Try to find the user in the ban list
+        target_user = None
+        try:
+            # Try by ID first
+            user_id = int(user)
+            target_user = discord.utils.get(banned_users, id=user_id)
+        except ValueError:
+            # Try by username#discriminator
+            target_user = discord.utils.get(banned_users, name=user)
+        
+        if not target_user:
+            return await interaction.response.send_message("User not found in ban list", ephemeral=True)
+            
+        await interaction.guild.unban(target_user, reason=reason)
+        await log_action("Unban", target_user, interaction.user, reason)
+        await interaction.response.send_message(
+            f"🔓 Unbanned {target_user.mention}" + 
+            (f"\nReason: {reason}" if reason else "")
+        )
+    except Exception as e:
+        await interaction.response.send_message(f"Failed to unban user: {e}", ephemeral=True)
+
+@bot.tree.command(name="help", description="Get help with the bot's commands")
+async def help(interaction: discord.Interaction):
+    """Display help information"""
+    if not await bot.check_rate_limit(interaction.user.id, "help"):
+        return await interaction.response.send_message(
+            "⏳ Please slow down with this command.",
+            ephemeral=True
+        )
+    
+    embed = discord.Embed(
+        title="textChatFilter Help", 
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(
+        name="🔒 Channel Management",
+        value=(
+            "• `/lockdown` - Lock all channels (mods only)\n"
+            "• `/unlockdown` - Unlock all channels\n"
+            "• `/lock_channel [channel]` - Lock specific channel\n"
+            "• `/unlock_channel [channel]` - Unlock specific channel"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🛡️ Word Management",
+        value=(
+            "• `/add_word` - Add banned word\n"
+            "• `/remove_word` - Remove banned word\n"
+            "• `/list_words` - List banned words\n"
+            "• `/reload_config` - Reload configuration"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="⚖️ Moderation",
+        value=(
+            "• `/infractions [user]` - Check user infractions\n"
+            "• `/clear_infractions [user]` - Clear user infractions\n"
+            "• `/purge_user [user]` - Delete user's recent messages\n"
+            "• `/purge_channel` - Delete recent channel messages\n"
+            "• `/warn [user] [reason]` - Warn a user\n"
+            "• `/timeout [user] [duration] [reason]` - Timeout a user\n"
+            "• `/untimeout [user] [reason]` - Remove timeout\n"
+            "• `/kick [user] [reason]` - Kick a user\n"
+            "• `/ban [user] [duration] [reason]` - Ban a user\n"
+            "• `/unban [user] [reason]` - Unban a user"
+        ),
+        inline=False
+    )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="warn", description="Warn a user")
+@app_commands.describe(
+    user="The user to warn",
+    reason="Reason for the warning"
+)
+@app_commands.checks.has_permissions(manage_messages=True)
+async def warn_user(interaction: discord.Interaction, user: discord.Member, reason: str):
+    """Manually warn a user"""
+    if not await bot.check_permissions(interaction):
+        return
+        
+    user_data = bot.infractions.get_user_data(user.id)
+    user_data["warnings"].append(datetime.utcnow().isoformat())
+    bot.infractions.data[str(user.id)] = user_data
+    bot.infractions.save_infractions()
+    
+    try:
+        await user.send(f"⚠️ You have been warned by {interaction.user.mention}\nReason: {reason}")
+    except discord.Forbidden:
+        pass
+        
+    await log_action("Manual Warning", user, interaction.user, reason)
+    await interaction.response.send_message(f"⚠️ Warned {user.mention}\nReason: {reason}")
+
+@bot.tree.command(name="timeout", description="Timeout a user")
+@app_commands.describe(
+    user="The user to timeout",
+    duration="Duration in minutes",
+    reason="Reason for the timeout"
+)
+@app_commands.checks.has_permissions(moderate_members=True)
+async def timeout_user(interaction: discord.Interaction, user: discord.Member, duration: int, reason: str):
+    """Manually timeout a user"""
+    if not await bot.check_permissions(interaction):
+        return
+        
+    if duration <= 0:
+        return await interaction.response.send_message("Duration must be positive", ephemeral=True)
+        
+    # Use timezone-aware datetime
+    until = discord.utils.utcnow() + timedelta(minutes=duration)
+    try:
+        await user.timeout(until, reason=reason)
+        
+        user_data = bot.infractions.get_user_data(user.id)
+        user_data["timeouts"].append(discord.utils.utcnow().isoformat())
+        bot.infractions.data[str(user.id)] = user_data
+        bot.infractions.save_infractions()
+        
+        try:
+            await user.send(
+                f"⏳ You have been timed out by {interaction.user.mention} until {until.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                f"Reason: {reason}"
+            )
+        except discord.Forbidden:
+            pass
+            
+        await log_action("Manual Timeout", user, interaction.user, reason, f"{duration} minutes")
+        await interaction.response.send_message(
+            f"⏳ Timed out {user.mention} for {duration} minutes\n"
+            f"Reason: {reason}"
+        )
+    except Exception as e:
+        await interaction.response.send_message(f"Failed to timeout user: {e}", ephemeral=True)
+
+@bot.tree.command(name="kick", description="Kick a user")
+@app_commands.describe(
+    user="The user to kick",
+    reason="Reason for the kick"
+)
+@app_commands.checks.has_permissions(kick_members=True)
+async def kick_user(interaction: discord.Interaction, user: discord.Member, reason: str):
+    """Manually kick a user"""
+    if not await bot.check_permissions(interaction):
+        return
+        
+    try:
+        user_data = bot.infractions.get_user_data(user.id)
+        user_data["kicks"].append(datetime.utcnow().isoformat())
+        bot.infractions.data[str(user.id)] = user_data
+        bot.infractions.save_infractions()
+        
+        try:
+            await user.send(f"🚪 You have been kicked by {interaction.user.mention}\nReason: {reason}")
+        except discord.Forbidden:
+            pass
+            
+        await user.kick(reason=reason)
+        await log_action("Manual Kick", user, interaction.user, reason)
+        await interaction.response.send_message(f"🚪 Kicked {user.mention}\nReason: {reason}")
+    except Exception as e:
+        await interaction.response.send_message(f"Failed to kick user: {e}", ephemeral=True)
+
+@bot.tree.command(name="ban", description="Ban a user")
+@app_commands.describe(
+    user="The user to ban",
+    duration="Duration in days (0 for permanent)",
+    reason="Reason for the ban"
+)
+@app_commands.checks.has_permissions(ban_members=True)
+async def ban_user(interaction: discord.Interaction, user: discord.Member, duration: int, reason: str):
+    """Manually ban a user"""
+    if not await bot.check_permissions(interaction):
+        return
+        
+    user_data = bot.infractions.get_user_data(user.id)
+    ban_count = len(user_data["bans"])
+    
+    # Permanent ban if 3+ bans or duration=0
+    permanent = (ban_count >= 3) or (duration == 0)
+    
+    try:
+        if permanent:
+            await user.ban(reason=f"{reason} (Permanent ban)", delete_message_days=1)
+            message = f"🔨 Permanently banned {user.mention}"
+        else:
+            await user.ban(reason=f"{reason} (Temp ban: {duration} days)", delete_message_days=1)
+            message = f"🔨 Banned {user.mention} for {duration} days"
+            
+        user_data["bans"].append(datetime.utcnow().isoformat())
+        bot.infractions.data[str(user.id)] = user_data
+        bot.infractions.save_infractions()
+        
+        try:
+            if permanent:
+                await user.send(f"🔨 You have been permanently banned by {interaction.user.mention}\nReason: {reason}")
+            else:
+                await user.send(
+                    f"🔨 You have been banned by {interaction.user.mention} for {duration} days\n"
+                    f"Reason: {reason}\n"
+                    f"Ban will be lifted on {(datetime.utcnow() + timedelta(days=duration)).strftime('%Y-%m-%d')}"
+                )
+        except discord.Forbidden:
+            pass
+            
+        await log_action("Permanent Ban" if permanent else "Temporary Ban", 
+                        user, interaction.user, reason, 
+                        "Permanent" if permanent else f"{duration} days")
+        await interaction.response.send_message(f"{message}\nReason: {reason}")
+    except Exception as e:
+        await interaction.response.send_message(f"Failed to ban user: {e}", ephemeral=True)
+
+# Run the bot
+if __name__ == "__main__":
+    TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+    if not TOKEN:
+        raise ValueError("""
+        No DISCORD_BOT_TOKEN environment variable found. Please:
+        1. Create a .env file in the same directory as your script
+        2. Add this line to it: DISCORD_BOT_TOKEN=your_bot_token_here
+        3. Make sure python-dotenv is installed (pip install python-dotenv)
+        """)
+    bot.run(TOKEN)
